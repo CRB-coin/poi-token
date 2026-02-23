@@ -1,0 +1,20 @@
+{
+  "name": "poi-miner",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "mine": "npx ts-node mine.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.4.0",
+    "@solana/spl-token": "^0.4.0",
+    "@solana/web3.js": "^1.95.0",
+    "dotenv": "^16.4.0",
+    "js-sha3": "^0.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.4.0"
+  }
+}
