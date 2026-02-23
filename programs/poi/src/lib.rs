@@ -5,22 +5,23 @@ use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount};
 pub mod verify;
 pub mod words;
 
-declare_id!("Aio7qosxjY32JuFfSrbpdv2kqYu3MF6YynPdai22HMAg");
+declare_id!("422WLuzcNAwXdG7YC4QFxhBYz7AcA4H6uCX2mo6UG8hp");
 
 // ============================================================
 // Constants
 // ============================================================
 
-const MAX_SUPPLY: u64 = 2_100_000_000_000_000 * 1_000; // 2.1 quadrillion × 10^3 (3 decimals)
-const INITIAL_REWARD: u64 = 5_000_000_000 * 1_000;      // 5 billion CRB × 10^3
-const HALVING_INTERVAL: u64 = 210_000;
-const EPOCH_DURATION: i64 = 600;                         // 10 min production epoch
+const MAX_SUPPLY: u64 = 100_000_000_000_000;               // 100B × 10^3 (3 decimals)
+const INITIAL_REWARD: u64 = 250_000_000;                    // 250K CRB × 10^3
+const HALVING_INTERVAL: u64 = 200_000;
+const EPOCH_DURATION: i64 = 600;                            // 10 min
 const TARGET_SOLUTIONS: u64 = 50;
-const INITIAL_DIFFICULTY: u64 = 8;                       // 8 for testing (20 production)
+const INITIAL_DIFFICULTY: u64 = 8;
 const MAX_DIFFICULTY: u64 = 250;
-const MIN_DIFFICULTY: u64 = 4;                           // lowered from 8 for early-stage UX
-const MAX_DIFFICULTY_ADJ: u64 = 5;                       // max ±5 per epoch (bounds crank trust)
-const CLAIM_EXPIRY_EPOCHS: u64 = 500;                    // unclaimed solutions expire after 500 epochs
+const MIN_DIFFICULTY: u64 = 4;
+const MAX_DIFFICULTY_ADJ: u64 = 5;
+const CLAIM_EXPIRY_EPOCHS: u64 = 500;
+const VESTING_DURATION: i64 = 30 * 24 * 3600;              // 30 days in seconds
 
 // ============================================================
 // Program
@@ -64,10 +65,9 @@ pub mod proof_of_inference {
 
     /// Submit a mining solution.
     ///
-    /// Phase 1 key change: mine_state is READ-ONLY.
-    /// No shared state writes — each submit only creates a unique Solution PDA.
-    /// This makes all submits fully parallelizable on Solana's SVM.
-    pub fn submit_solution(ctx: Context<SubmitSolution>, text: String, nonce: u64) -> Result<()> {
+    /// mine_state is READ-ONLY — zero write-lock contention.
+    /// Each submit only creates a unique Solution PDA.
+    pub fn submit_solution(ctx: Context<SubmitSolution>, text: String, nonce: u64, recipient: Pubkey) -> Result<()> {
         let clock = Clock::get()?;
 
         // ── Read state (mine_state is read-only, no write lock) ──
@@ -85,8 +85,6 @@ pub mod proof_of_inference {
 
         // ── Supply cap ──
         require!(total_supply < MAX_SUPPLY, ErrorCode::MaxSupplyReached);
-
-        // ── NO MAX_SOLUTIONS check — difficulty naturally regulates throughput ──
 
         // ── Derive required words ──
         let rw = words::derive_words(&challenge_seed, difficulty);
@@ -125,28 +123,33 @@ pub mod proof_of_inference {
             ErrorCode::InsufficientDifficulty
         );
 
-        // ── Write Solution PDA (only per-miner state, no shared writes) ──
+        // ── Write Solution PDA ──
         let solution = &mut ctx.accounts.solution;
         solution.miner = miner_key;
+        solution.recipient = recipient;
         solution.epoch = epoch_number;
         solution.nonce = nonce;
         solution.hash = hash_bytes;
         solution.bump = ctx.bumps.solution;
 
-        // ── NO state.solutions_in_epoch += 1 ──
-        // This is the key Phase 1 change: submit writes ZERO shared state.
-        // Solution count is indexed off-chain by the Crank service.
+        Ok(())
+    }
 
+    /// Create a VestingAccount for a miner. Called once before first claim.
+    pub fn create_vesting(ctx: Context<CreateVesting>) -> Result<()> {
+        let v = &mut ctx.accounts.vesting;
+        v.miner = ctx.accounts.miner.key();
+        v.locked = 0;
+        v.unlocked = 0;
+        v.last_update = Clock::get()?.unix_timestamp;
+        v.bump = ctx.bumps.vesting;
         Ok(())
     }
 
     /// Claim reward for a submitted solution.
     ///
-    /// Replaces the old `settle` instruction. Key differences:
-    /// - Miners call this themselves (self-service, no time pressure)
-    /// - Solutions expire after CLAIM_EXPIRY_EPOCHS (unclaimed rent is forfeited)
-    /// - Anyone CAN call this on behalf of a miner (permissionless), but
-    ///   reward + rent always go to the solution's miner.
+    /// Does NOT mint tokens directly. Instead, adds reward to VestingAccount.locked.
+    /// Tokens are minted later via `withdraw` as they vest over VESTING_DURATION.
     pub fn claim(ctx: Context<Claim>) -> Result<()> {
         let clock = Clock::get()?;
 
@@ -155,7 +158,6 @@ pub mod proof_of_inference {
         let epoch_end_time = ctx.accounts.mine_state.epoch_end_time;
         let total_mined = ctx.accounts.mine_state.total_mined;
         let total_supply = ctx.accounts.mine_state.total_supply;
-        let bump = ctx.accounts.mine_state.bump;
         let solution_epoch = ctx.accounts.solution.epoch;
 
         // ── Solution's epoch must have ended ──
@@ -178,42 +180,60 @@ pub mod proof_of_inference {
         let reward = calculate_reward(total_mined);
         let actual_reward = reward.min(MAX_SUPPLY.saturating_sub(total_supply));
 
-        // ── CPI: mint tokens to miner ──
-        if actual_reward > 0 {
-            let seeds = &[b"mine_state".as_ref(), &[bump]];
-            let signer_seeds = &[&seeds[..]];
+        // ── Update vesting ──
+        let vesting = &mut ctx.accounts.vesting;
 
-            token::mint_to(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    MintTo {
-                        mint: ctx.accounts.mint.to_account_info(),
-                        to: ctx.accounts.recipient_token_account.to_account_info(),
-                        authority: ctx.accounts.mine_state.to_account_info(),
-                    },
-                    signer_seeds,
-                ),
-                actual_reward,
-            )?;
-        }
+        // Accrue any pending vested amount
+        drip_vesting(vesting, clock.unix_timestamp);
 
-        // ── Update state ──
+        // Add new reward to locked
+        vesting.locked = vesting.locked.checked_add(actual_reward).unwrap();
+
+        // ── Update mine state (reserve supply, no mint yet) ──
         let state = &mut ctx.accounts.mine_state;
         state.total_mined += 1;
-        if actual_reward > 0 {
-            state.total_supply += actual_reward;
-        }
+        state.total_supply = state.total_supply.checked_add(actual_reward).unwrap();
 
-        // Solution PDA closed by Anchor `close` constraint → rent to rent_recipient (miner)
+        // Solution PDA closed by Anchor `close` constraint → rent to miner
+        Ok(())
+    }
+
+    /// Withdraw vested tokens.
+    ///
+    /// Calculates newly vested amount, then mints to recipient's token account.
+    pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+        let clock = Clock::get()?;
+        let bump = ctx.accounts.mine_state.bump;
+
+        // ── Update vesting ──
+        let vesting = &mut ctx.accounts.vesting;
+        drip_vesting(vesting, clock.unix_timestamp);
+
+        let amount = vesting.unlocked;
+        require!(amount > 0, ErrorCode::NothingToWithdraw);
+        vesting.unlocked = 0;
+
+        // ── CPI: mint tokens to recipient ──
+        let seeds = &[b"mine_state".as_ref(), &[bump]];
+        let signer_seeds = &[&seeds[..]];
+
+        token::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.recipient_token_account.to_account_info(),
+                    authority: ctx.accounts.mine_state.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            amount,
+        )?;
 
         Ok(())
     }
 
-    /// Advance to the next epoch.
-    ///
-    /// Called by Crank service after epoch ends.
-    /// Crank indexes Solution PDAs off-chain and passes solution_count.
-    /// Difficulty adjustment is capped at ±5 per epoch, bounding crank trust risk.
+    /// Advance to the next epoch (crank only).
     pub fn advance_epoch(ctx: Context<AdvanceEpoch>, solution_count: u64) -> Result<()> {
         let clock = Clock::get()?;
         let state = &mut ctx.accounts.mine_state;
@@ -224,34 +244,29 @@ pub mod proof_of_inference {
             ErrorCode::EpochNotEnded
         );
 
-        // ── Proportional difficulty adjustment (log2 dampened, ±5 capped) ──
-        let target = TARGET_SOLUTIONS;
+        // ── Record solutions in this epoch ──
+        state.solutions_in_epoch = solution_count;
 
+        // ── Adjust difficulty ──
+        let target = TARGET_SOLUTIONS;
         if solution_count > target + target / 5 {
-            // Too many solutions → increase difficulty
             let ratio = solution_count / target;
             let increase = log2_ceil(ratio).max(1).min(MAX_DIFFICULTY_ADJ);
             state.difficulty = state.difficulty.saturating_add(increase).min(MAX_DIFFICULTY);
         } else if solution_count == 0 {
-            // Empty epoch → decrease by max amount
             state.difficulty = state.difficulty.saturating_sub(MAX_DIFFICULTY_ADJ).max(MIN_DIFFICULTY);
         } else if solution_count < target.saturating_sub(target / 5) {
-            // Too few solutions → decrease difficulty
-            let ratio = target / solution_count;
+            let ratio = target / solution_count.max(1);
             let decrease = log2_ceil(ratio).max(1).min(MAX_DIFFICULTY_ADJ);
             state.difficulty = state.difficulty.saturating_sub(decrease).max(MIN_DIFFICULTY);
         }
-        // If within ±20% of target, difficulty stays the same
-
-        // ── Store solution count for record-keeping ──
-        state.solutions_in_epoch = solution_count;
 
         // ── New challenge seed ──
         let seed_input = [
             state.challenge_seed.as_ref(),
             clock.unix_timestamp.to_le_bytes().as_ref(),
-            state.epoch_number.to_le_bytes().as_ref(),
             clock.slot.to_le_bytes().as_ref(),
+            solution_count.to_le_bytes().as_ref(),
         ]
         .concat();
         state.challenge_seed = keccak::hash(&seed_input).to_bytes();
@@ -260,16 +275,11 @@ pub mod proof_of_inference {
         state.epoch_number += 1;
         state.epoch_start_time = clock.unix_timestamp;
         state.epoch_end_time = clock.unix_timestamp + EPOCH_DURATION;
-        state.settled_in_epoch = 0;
 
         Ok(())
     }
 
-    /// Close an expired Solution PDA and reclaim rent.
-    ///
-    /// Anyone can call this after CLAIM_EXPIRY_EPOCHS have passed.
-    /// Rent goes to the caller as incentive for cleanup.
-    /// The miner's reward is forfeited.
+    /// Close an expired, unclaimed solution. Rent goes to caller as cleanup incentive.
     pub fn close_expired(ctx: Context<CloseExpired>) -> Result<()> {
         let current_epoch = ctx.accounts.mine_state.epoch_number;
         let solution_epoch = ctx.accounts.solution.epoch;
@@ -280,7 +290,6 @@ pub mod proof_of_inference {
         );
 
         // Solution PDA closed by Anchor `close` constraint → rent to closer
-
         Ok(())
     }
 
@@ -290,8 +299,35 @@ pub mod proof_of_inference {
         Ok(())
     }
 
-    /// Create token metadata via Metaplex Token Metadata program.
-    /// Only callable by crank authority.
+    /// Create token metadata via Metaplex.
+
+    /// Reset mining state. Crank authority only. For re-initialization.
+    pub fn reset_state(ctx: Context<ResetState>) -> Result<()> {
+        let clock = Clock::get()?;
+        let state = &mut ctx.accounts.mine_state;
+
+        let seed_input = [
+            clock.slot.to_le_bytes().as_ref(),
+            clock.unix_timestamp.to_le_bytes().as_ref(),
+            state.key().as_ref(),
+        ]
+        .concat();
+        let challenge_seed = keccak::hash(&seed_input).to_bytes();
+
+        state.total_mined = 0;
+        state.difficulty = INITIAL_DIFFICULTY;
+        state.challenge_seed = challenge_seed;
+        state.epoch_number = 0;
+        state.epoch_start_time = clock.unix_timestamp;
+        state.epoch_end_time = clock.unix_timestamp + EPOCH_DURATION;
+        state.solutions_in_epoch = 0;
+        state.settled_in_epoch = 0;
+        state.total_supply = 0;
+        // mint and crank_authority and bump stay the same
+
+        Ok(())
+    }
+
     pub fn create_metadata(
         ctx: Context<CreateMetadata>,
         name: String,
@@ -337,34 +373,25 @@ pub mod proof_of_inference {
 }
 
 // ============================================================
-// Helper Functions
+// Helpers
 // ============================================================
 
-/// Check if hash meets difficulty: first `difficulty` bits must be zero.
-fn check_difficulty(hash: &[u8; 32], difficulty: u64) -> bool {
-    if difficulty == 0 {
-        return true;
+/// Drip vesting: move locked → unlocked based on elapsed time.
+fn drip_vesting(v: &mut Account<VestingAccount>, now: i64) {
+    if v.locked == 0 || now <= v.last_update {
+        v.last_update = now;
+        return;
     }
-    if difficulty >= 256 {
-        return false;
-    }
-    let full_bytes = (difficulty / 8) as usize;
-    let remaining_bits = (difficulty % 8) as u8;
-
-    let mut i = 0;
-    while i < full_bytes {
-        if hash[i] != 0 {
-            return false;
-        }
-        i += 1;
-    }
-    if remaining_bits > 0 && full_bytes < 32 {
-        let mask: u8 = 0xFF << (8 - remaining_bits);
-        if hash[full_bytes] & mask != 0 {
-            return false;
-        }
-    }
-    true
+    let elapsed = now - v.last_update;
+    let release = if elapsed >= VESTING_DURATION {
+        v.locked
+    } else {
+        // Use u128 to avoid overflow
+        (v.locked as u128 * elapsed as u128 / VESTING_DURATION as u128) as u64
+    };
+    v.unlocked += release;
+    v.locked -= release;
+    v.last_update = now;
 }
 
 /// Reward with halving: INITIAL_REWARD >> (total_mined / HALVING_INTERVAL)
@@ -376,17 +403,40 @@ fn calculate_reward(total_mined: u64) -> u64 {
     INITIAL_REWARD >> halvings
 }
 
-/// Integer ceiling of log2. Returns 0 for x <= 1.
-/// Used for proportional difficulty adjustment dampening.
-fn log2_ceil(x: u64) -> u64 {
-    if x <= 1 {
+/// Check that hash has at least `difficulty` leading zero bits.
+fn check_difficulty(hash: &[u8; 32], difficulty: u64) -> bool {
+    let full_bytes = (difficulty / 8) as usize;
+    let remaining_bits = (difficulty % 8) as u8;
+
+    for i in 0..full_bytes {
+        if i >= 32 {
+            return false;
+        }
+        if hash[i] != 0 {
+            return false;
+        }
+    }
+
+    if remaining_bits > 0 && full_bytes < 32 {
+        let mask = 0xFF << (8 - remaining_bits);
+        if hash[full_bytes] & mask != 0 {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Ceiling of log2(n), minimum 1.
+fn log2_ceil(n: u64) -> u64 {
+    if n <= 1 {
         return 0;
     }
-    64 - (x - 1).leading_zeros() as u64
+    64 - (n - 1).leading_zeros() as u64
 }
 
 // ============================================================
-// Accounts
+// Account Structs
 // ============================================================
 
 #[derive(Accounts)]
@@ -420,9 +470,7 @@ pub struct Initialize<'info> {
 
 #[derive(Accounts)]
 pub struct SubmitSolution<'info> {
-    // ── READ-ONLY: no write lock acquired ──
-    // This is the key Phase 1 optimization.
-    // All submits can execute in parallel since they don't write shared state.
+    // READ-ONLY: no write lock acquired
     #[account(
         seeds = [b"mine_state"],
         bump = mine_state.bump,
@@ -445,6 +493,23 @@ pub struct SubmitSolution<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CreateVesting<'info> {
+    #[account(
+        init,
+        payer = miner,
+        space = 8 + VestingAccount::INIT_SPACE,
+        seeds = [b"vesting", miner.key().as_ref()],
+        bump,
+    )]
+    pub vesting: Account<'info, VestingAccount>,
+
+    #[account(mut)]
+    pub miner: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct Claim<'info> {
     #[account(
         mut,
@@ -457,9 +522,40 @@ pub struct Claim<'info> {
         mut,
         seeds = [b"solution", solution.miner.as_ref(), &solution.epoch.to_le_bytes()],
         bump = solution.bump,
-        close = rent_recipient,
+        close = miner,
     )]
     pub solution: Account<'info, Solution>,
+
+    #[account(
+        mut,
+        seeds = [b"vesting", solution.miner.as_ref()],
+        bump = vesting.bump,
+    )]
+    pub vesting: Account<'info, VestingAccount>,
+
+    #[account(
+        mut,
+        constraint = miner.key() == solution.miner @ ErrorCode::InvalidRecipient,
+    )]
+    pub miner: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(
+        seeds = [b"mine_state"],
+        bump = mine_state.bump,
+    )]
+    pub mine_state: Account<'info, MineState>,
+
+    #[account(
+        mut,
+        seeds = [b"vesting", miner.key().as_ref()],
+        bump = vesting.bump,
+    )]
+    pub vesting: Account<'info, VestingAccount>,
 
     #[account(
         mut,
@@ -468,21 +564,17 @@ pub struct Claim<'info> {
     )]
     pub mint: Account<'info, Mint>,
 
-    /// Token account to receive mined tokens (must belong to solution.miner).
+    /// Token account to receive tokens. Miner signature is the authorization.
     #[account(
         mut,
         token::mint = mint,
-        constraint = recipient_token_account.owner == solution.miner @ ErrorCode::InvalidRecipient,
     )]
     pub recipient_token_account: Account<'info, TokenAccount>,
 
-    /// Receives rent from closed Solution PDA (must be the miner).
-    /// CHECK: validated by constraint.
     #[account(
-        mut,
-        constraint = rent_recipient.key() == solution.miner @ ErrorCode::InvalidRecipient,
+        constraint = miner.key() == vesting.miner @ ErrorCode::Unauthorized
     )]
-    pub rent_recipient: UncheckedAccount<'info>,
+    pub miner: Signer<'info>,
 
     pub token_program: Program<'info, Token>,
 }
@@ -518,6 +610,21 @@ pub struct SetCrankAuthority<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ResetState<'info> {
+    #[account(
+        mut,
+        seeds = [b"mine_state"],
+        bump = mine_state.bump,
+    )]
+    pub mine_state: Account<'info, MineState>,
+
+    #[account(
+        constraint = authority.key() == mine_state.crank_authority @ ErrorCode::Unauthorized
+    )]
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct CloseExpired<'info> {
     #[account(
         seeds = [b"mine_state"],
@@ -537,6 +644,7 @@ pub struct CloseExpired<'info> {
     #[account(mut)]
     pub closer: Signer<'info>,
 }
+
 #[derive(Accounts)]
 pub struct CreateMetadata<'info> {
     #[account(
@@ -569,7 +677,6 @@ pub struct CreateMetadata<'info> {
     pub token_metadata_program: UncheckedAccount<'info>,
 }
 
-
 // ============================================================
 // State
 // ============================================================
@@ -583,9 +690,9 @@ pub struct MineState {
     pub epoch_number: u64,         // 8
     pub epoch_start_time: i64,     // 8
     pub epoch_end_time: i64,       // 8
-    pub solutions_in_epoch: u64,   // 8   — set by crank during advance_epoch (record-keeping)
+    pub solutions_in_epoch: u64,   // 8   — set by crank during advance_epoch
     pub settled_in_epoch: u64,     // 8   — reserved for compatibility
-    pub total_supply: u64,         // 8
+    pub total_supply: u64,         // 8   — committed supply (locked + unlocked + released)
     pub mint: Pubkey,              // 32
     pub crank_authority: Pubkey,   // 32  — only this address can call advance_epoch
     pub bump: u8,                  // 1
@@ -594,12 +701,23 @@ pub struct MineState {
 #[account]
 #[derive(InitSpace)]
 pub struct Solution {
-    pub miner: Pubkey,             // 32
+    pub miner: Pubkey,             // 32  — gas payer (submitter)
+    pub recipient: Pubkey,         // 32  — token receiver
     pub epoch: u64,                // 8
     pub nonce: u64,                // 8
     pub hash: [u8; 32],            // 32
     pub bump: u8,                  // 1
-}                                  // total: 81 + 8 discriminator = 89
+}                                  // total: 113 + 8 discriminator = 121
+
+#[account]
+#[derive(InitSpace)]
+pub struct VestingAccount {
+    pub miner: Pubkey,             // 32  — gas payer / owner
+    pub locked: u64,               // 8   — vesting, not yet available
+    pub unlocked: u64,             // 8   — vested, ready to withdraw
+    pub last_update: i64,          // 8   — last drip calculation time
+    pub bump: u8,                  // 1
+}                                  // total: 57 + 8 discriminator = 65
 
 // ============================================================
 // Errors
@@ -617,12 +735,14 @@ pub enum ErrorCode {
     EpochEnded,
     #[msg("Epoch has not ended yet")]
     EpochNotEnded,
-    #[msg("Recipient does not match solution miner")]
+    #[msg("Recipient does not match")]
     InvalidRecipient,
     #[msg("Solution claim period has expired (500 epochs)")]
     ClaimExpired,
     #[msg("Solution has not expired yet")]
     NotExpired,
-    #[msg("Unauthorized: not the crank authority")]
+    #[msg("Unauthorized")]
     Unauthorized,
+    #[msg("Nothing to withdraw")]
+    NothingToWithdraw,
 }

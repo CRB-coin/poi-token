@@ -6,3 +6,8 @@
 *.bak
 target/
 node_modules/
+miner/init-new.js
+miner/claim-all.js
+*-keypair.json
+deployer-keypair.json
+new-program-keypair.json

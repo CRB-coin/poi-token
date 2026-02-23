@@ -1,18 +1,18 @@
 # CRB Token — Proof of Inference Mining
 
-A Solana-based mining token where miners must generate natural language text containing specific words and solve a Proof-of-Work challenge.
+A Solana-based mining token where miners must generate natural language text containing specific words and solve a Proof-of-Work challenge. Rewards vest linearly over 30 days to promote long-term alignment.
 
 ## Mainnet Deployment
 
 | Item | Value |
 |------|-------|
-| Program ID | `Aio7qosxjY32JuFfSrbpdv2kqYu3MF6YynPdai22HMAg` |
-| Token Mint | `G3NiS1ijZtTagpMEwbGVsVGQbCMRmPRpqFjgARnzSEQS` |
-| MineState PDA | `7cPxr8BoimP3WsxEPrcLxiqJJiCtPwHJkDJnXenMFagP` |
+| Program ID | `422WLuzcNAwXdG7YC4QFxhBYz7AcA4H6uCX2mo6UG8hp` |
+| Token Mint | `E72UpkqD2vtBaWVqsjo3kASazegozQwXH5tARbyyZYy1` |
 | Decimals | 3 |
-| Max Supply | 2,100,000,000,000,000,000 (2.1 quadrillion raw units) |
-| Initial Reward | 5,000,000,000,000 per solution (5 billion CRB raw units) |
-| Halving Interval | Every 210,000 solutions |
+| Max Supply | 100,000,000,000 CRB (100 billion) |
+| Initial Reward | 250,000 CRB per solution |
+| Halving Interval | Every 200,000 solutions |
+| Vesting | 30-day linear release |
 | Epoch Duration | 600 seconds (10 minutes) |
 | Target Solutions | 50 per epoch |
 | Difficulty Range | 4 - 250 |
@@ -25,9 +25,30 @@ A Solana-based mining token where miners must generate natural language text con
 2. **Derive Words** — Deterministically derive required words from the challenge seed
 3. **Generate Text** — Create natural language text (256-800 bytes) containing all required words in order
 4. **Proof of Work** — Find a nonce such that `keccak256(challenge_seed | miner_key | text | "||" | nonce)` has enough leading zero bits
-5. **Submit Solution** — Submit the text + nonce on-chain (creates a Solution PDA)
+5. **Submit Solution** — Submit the text + nonce + recipient on-chain (creates a Solution PDA)
 6. **Advance Epoch** — After epoch ends, the crank advances to the next epoch
-7. **Claim Reward** — Miners claim their CRB tokens (Solution PDA is closed, rent returned)
+7. **Claim Reward** — Reward is added to the miner's VestingAccount (locked)
+8. **Withdraw** — Vested tokens are minted to the recipient wallet as they unlock over 30 days
+
+### Vesting
+
+All mining rewards go through a 30-day linear vesting schedule:
+
+- On **claim**, the reward is added to `VestingAccount.locked` (no tokens minted yet)
+- Over 30 days, locked tokens drip into `unlocked` proportionally
+- On **withdraw**, unlocked tokens are minted to the recipient's token account
+- Each miner has one VestingAccount PDA (`seeds = ["vesting", miner_key]`)
+- New claims stack on top of existing locked balance — the drip continues seamlessly
+
+This prevents mine-and-dump behavior and encourages long-term participation.
+
+### Recipient Separation
+
+Miners can specify a separate **recipient** wallet for token rewards:
+
+- The **miner wallet** pays gas and signs transactions
+- The **recipient wallet** receives CRB tokens
+- Set via `RECIPIENT` environment variable (defaults to miner wallet)
 
 ### Text Verification
 
@@ -56,10 +77,10 @@ Difficulty adjusts each epoch based on solution count vs target (50):
 
 | Total Mined | Reward per Solution |
 |-------------|-------------------|
-| 0 - 209,999 | 5,000,000,000,000 |
-| 210,000 - 419,999 | 2,500,000,000,000 |
-| 420,000 - 629,999 | 1,250,000,000,000 |
-| ... | Halves every 210,000 solutions |
+| 0 - 199,999 | 250,000 CRB |
+| 200,000 - 399,999 | 125,000 CRB |
+| 400,000 - 599,999 | 62,500 CRB |
+| ... | Halves every 200,000 solutions |
 
 ## Architecture
 
@@ -75,17 +96,20 @@ Zero write-lock contention design:
 | Instruction | Description |
 |-------------|-------------|
 | `initialize` | Create MineState PDA and token Mint |
-| `submit_solution(text, nonce)` | Submit a mining solution |
+| `submit_solution(text, nonce, recipient)` | Submit a mining solution |
 | `advance_epoch(solution_count)` | Advance to next epoch, adjust difficulty |
-| `claim_reward` | Claim CRB reward, close Solution PDA, recover rent |
+| `create_vesting` | Create a VestingAccount for a miner (once) |
+| `claim` | Claim reward into VestingAccount (locked) |
+| `withdraw` | Mint vested (unlocked) tokens to recipient |
 | `close_expired` | Close expired unclaimed solutions (500+ epochs old) |
+| `reset_state` | Reset mining state (admin only) |
 
 ## Quick Start
 
 ### Prerequisites
 
 - [Solana CLI](https://docs.solanalabs.com/cli/install)
-- [Node.js](https://nodejs.org/) v18+
+- [Node.js](https://nodejs.org/) v20+
 - A Solana wallet with SOL for transaction fees
 
 ### 1. Create a Miner Wallet
@@ -95,43 +119,45 @@ solana-keygen new -o miner-keypair.json
 solana address -k miner-keypair.json
 ```
 
-Fund this address with a small amount of SOL for transaction fees (~0.01 SOL).
+Fund this address with SOL for transaction fees (~0.5 SOL recommended).
 
-### 2. Run the Miner
+### 2. Install Dependencies
 
 ```bash
 cd miner
 npm install
+```
+
+### 3. Configure
+
+```bash
+# Required: path to your miner keypair
+export KEYPAIR=/path/to/miner-keypair.json
+
+# Optional: custom RPC endpoint
+export RPC_URL=https://solana-rpc.publicnode.com
+
+# Optional: separate recipient wallet for CRB tokens
+export RECIPIENT=<recipient-wallet-address>
+```
+
+### 4. Start Mining
+
+```bash
 npx ts-node --transpile-only mainnet-miner.ts
 ```
 
-By default, the miner reads `./miner-keypair.json`. To use a different wallet:
+The miner will:
+1. Create a VestingAccount (first run only)
+2. Submit solutions each epoch
+3. Advance epochs and claim rewards
+4. Periodically withdraw vested tokens
 
-```bash
-export KEYPAIR=/path/to/your/keypair.json
-npx ts-node --transpile-only mainnet-miner.ts
-```
+### Cost Estimate
 
-To use a custom RPC endpoint:
-
-```bash
-export RPC_URL=https://your-rpc-endpoint.com
-```
-
-### 3. Switch Receiving Wallet
-
-The mining wallet is the receiving wallet — CRB tokens are sent to the wallet that submitted the solution.
-
-To switch your receiving wallet:
-
-1. Stop the miner
-2. Set the new keypair:
-   ```bash
-   export KEYPAIR=/path/to/new-wallet.json
-   ```
-3. Restart the miner
-
-Previously submitted but unclaimed solutions will still be claimed to the old wallet. New solutions will go to the new wallet.
+- Net cost per epoch: ~0.001-0.003 SOL
+- 0.5 SOL is enough for several days of mining
+- Solution PDA rent is returned on claim
 
 ## Word List
 

@@ -1,5 +1,5 @@
 /**
- * PoI v2.2 Mainnet Miner
+ * PoI v3.0 Mainnet Miner (with Vesting)
  * Continuously mines POI tokens on Solana mainnet.
  */
 import {
@@ -16,7 +16,7 @@ import * as fs from "fs";
 
 // ── Config ──
 const RPC_URL = process.env.RPC_URL || "https://solana-rpc.publicnode.com";
-const PROGRAM_ID = new PublicKey("Aio7qosxjY32JuFfSrbpdv2kqYu3MF6YynPdai22HMAg");
+const PROGRAM_ID = new PublicKey("422WLuzcNAwXdG7YC4QFxhBYz7AcA4H6uCX2mo6UG8hp");
 const KEYPAIR_PATH = process.env.KEYPAIR || "./miner-keypair.json";
 
 const conn = new Connection(RPC_URL, "confirmed");
@@ -24,9 +24,15 @@ const miner = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(fs.readFileSync(KEYPAIR_PATH, "utf8")))
 );
 
+// Recipient wallet for CRB tokens (defaults to miner if not set)
+const RECIPIENT = process.env.RECIPIENT
+  ? new PublicKey(process.env.RECIPIENT)
+  : miner.publicKey;
+
 // ── PDAs ──
 const [stateAddr] = PublicKey.findProgramAddressSync([Buffer.from("mine_state")], PROGRAM_ID);
 const [mintAddr] = PublicKey.findProgramAddressSync([Buffer.from("mint")], PROGRAM_ID);
+const [vestingAddr] = PublicKey.findProgramAddressSync([Buffer.from("vesting"), miner.publicKey.toBuffer()], PROGRAM_ID);
 
 function disc(name: string) {
   return createHash("sha256").update("global:" + name).digest().subarray(0, 8);
@@ -205,12 +211,13 @@ async function submitSolution(epoch: number, nonce: bigint, text: string) {
     PROGRAM_ID
   );
 
-  // disc(8) + string_len(4) + string_bytes + nonce(8)
-  const data = Buffer.alloc(8 + 4 + textBuf.length + 8);
+  // disc(8) + string_len(4) + string_bytes + nonce(8) + recipient(32)
+  const data = Buffer.alloc(8 + 4 + textBuf.length + 8 + 32);
   disc("submit_solution").copy(data, 0);
   data.writeUInt32LE(textBuf.length, 8);
   textBuf.copy(data, 12);
   data.writeBigUInt64LE(nonce, 12 + textBuf.length);
+  RECIPIENT.toBuffer().copy(data, 12 + textBuf.length + 8);
 
   const tx = new Transaction();
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }));
@@ -250,22 +257,32 @@ async function advanceEpoch(solutionCount: number) {
 }
 
 // ── Claim reward ──
+async function createVesting() {
+  const info = await conn.getAccountInfo(vestingAddr);
+  if (info) { console.log("  VestingAccount already exists"); return; }
+
+  console.log("  Creating VestingAccount...");
+  const tx = new Transaction();
+  tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 50_000 }));
+  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000 }));
+  tx.add(new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [
+      { pubkey: vestingAddr, isSigner: false, isWritable: true },
+      { pubkey: miner.publicKey, isSigner: true, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data: disc("create_vesting"),
+  }));
+  const sig = await sendAndConfirmTransaction(conn, tx, [miner]);
+  console.log(`  ✅ VestingAccount created: ${sig}`);
+}
+
 async function claimReward(epoch: number) {
   const [solnAddr] = PublicKey.findProgramAddressSync(
     [Buffer.from("solution"), miner.publicKey.toBuffer(), new Uint8Array(new BigUint64Array([BigInt(epoch)]).buffer)],
     PROGRAM_ID
   );
-  const ata = await getAssociatedTokenAddress(mintAddr, miner.publicKey);
-
-  // Ensure ATA exists
-  const ataInfo = await conn.getAccountInfo(ata);
-  if (!ataInfo) {
-    console.log("  Creating token account...");
-    const createTx = new Transaction().add(
-      createAssociatedTokenAccountInstruction(miner.publicKey, ata, miner.publicKey, mintAddr)
-    );
-    await sendAndConfirmTransaction(conn, createTx, [miner]);
-  }
 
   const data = disc("claim");
   const tx = new Transaction();
@@ -276,12 +293,43 @@ async function claimReward(epoch: number) {
     keys: [
       { pubkey: stateAddr, isSigner: false, isWritable: true },
       { pubkey: solnAddr, isSigner: false, isWritable: true },
-      { pubkey: mintAddr, isSigner: false, isWritable: true },
-      { pubkey: ata, isSigner: false, isWritable: true },
-      { pubkey: miner.publicKey, isSigner: false, isWritable: true },
-      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: vestingAddr, isSigner: false, isWritable: true },
+      { pubkey: miner.publicKey, isSigner: true, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data,
+  }));
+  return sendAndConfirmTransaction(conn, tx, [miner]);
+}
+
+async function withdrawVested() {
+  const recipient = RECIPIENT;
+  const ata = await getAssociatedTokenAddress(mintAddr, recipient);
+
+  // Ensure ATA exists
+  const ataInfo = await conn.getAccountInfo(ata);
+  if (!ataInfo) {
+    console.log("  Creating token account for recipient...");
+    const createTx = new Transaction().add(
+      createAssociatedTokenAccountInstruction(miner.publicKey, ata, recipient, mintAddr)
+    );
+    await sendAndConfirmTransaction(conn, createTx, [miner]);
+  }
+
+  const tx = new Transaction();
+  tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 100_000 }));
+  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000 }));
+  tx.add(new TransactionInstruction({
+    programId: PROGRAM_ID,
+    keys: [
+      { pubkey: stateAddr, isSigner: false, isWritable: false },
+      { pubkey: vestingAddr, isSigner: false, isWritable: true },
+      { pubkey: mintAddr, isSigner: false, isWritable: true },
+      { pubkey: ata, isSigner: false, isWritable: true },
+      { pubkey: miner.publicKey, isSigner: true, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    data: disc("withdraw"),
   }));
   return sendAndConfirmTransaction(conn, tx, [miner]);
 }
@@ -289,15 +337,20 @@ async function claimReward(epoch: number) {
 // ── Main loop ──
 async function main() {
   console.log("============================================================");
-  console.log("  PoI v2.2 Mainnet Miner");
+  console.log("  PoI v3.0 Mainnet Miner (with Vesting)");
   console.log("============================================================");
-  console.log(`Miner: ${miner.publicKey.toBase58()}`);
-  console.log(`Program: ${PROGRAM_ID.toBase58()}`);
-  console.log(`RPC: ${RPC_URL}`);
+  console.log(`Miner:     ${miner.publicKey.toBase58()}`);
+  console.log(`Recipient: ${RECIPIENT.toBase58()}`);
+  console.log(`Program:   ${PROGRAM_ID.toBase58()}`);
+  console.log(`RPC:       ${RPC_URL}`);
   const bal = await conn.getBalance(miner.publicKey);
-  console.log(`Balance: ${bal / 1e9} SOL\n`);
+  console.log(`Balance:   ${bal / 1e9} SOL\n`);
+
+  // Ensure VestingAccount exists
+  await createVesting();
 
   let lastSubmittedEpoch = -1;
+  let withdrawCounter = 0;
 
   while (true) {
     try {
@@ -358,6 +411,16 @@ async function main() {
       console.log(`  ✅ Submitted: ${sig}`);
       lastSubmittedEpoch = state.epoch;
       localSolutionCount++;
+      withdrawCounter++;
+
+      // Periodically withdraw vested tokens (every 10 epochs)
+      if (withdrawCounter % 10 === 0) {
+        try {
+          await withdrawVested();
+        } catch (e: any) {
+          console.log(`  ⚠️ Withdraw skipped: ${e.message?.slice(0, 80)}`);
+        }
+      }
 
       // Wait for epoch to end
       const newState = await readMineState();
