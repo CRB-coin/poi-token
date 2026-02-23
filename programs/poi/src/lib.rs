@@ -5,15 +5,15 @@ use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount};
 pub mod verify;
 pub mod words;
 
-declare_id!("422WLuzcNAwXdG7YC4QFxhBYz7AcA4H6uCX2mo6UG8hp");
+declare_id!("HGDCZkwnD3vXkjdMUugEdimLoZB87TyQLHgz1Ro346y7");
 
 // ============================================================
 // Constants
 // ============================================================
 
 const MAX_SUPPLY: u64 = 100_000_000_000_000;               // 100B × 10^3 (3 decimals)
-const INITIAL_REWARD: u64 = 250_000_000;                    // 250K CRB × 10^3
-const HALVING_INTERVAL: u64 = 200_000;
+const INITIAL_REWARD: u64 = 25_000_000;                    // 25K CRB × 10^3
+const HALVING_INTERVAL: u64 = 1_000_000;
 const EPOCH_DURATION: i64 = 600;                            // 10 min
 const TARGET_SOLUTIONS: u64 = 50;
 const INITIAL_DIFFICULTY: u64 = 8;

@@ -6,12 +6,12 @@ A Solana-based mining token where miners must generate natural language text con
 
 | Item | Value |
 |------|-------|
-| Program ID | `422WLuzcNAwXdG7YC4QFxhBYz7AcA4H6uCX2mo6UG8hp` |
-| Token Mint | `E72UpkqD2vtBaWVqsjo3kASazegozQwXH5tARbyyZYy1` |
+| Program ID | `HGDCZkwnD3vXkjdMUugEdimLoZB87TyQLHgz1Ro346y7` |
+| Token Mint | `AXAabZe2wqveY3nE7qB9aCVEn1mDwdfXGWvZCEaCVniT` |
 | Decimals | 3 |
 | Max Supply | 100,000,000,000 CRB (100 billion) |
-| Initial Reward | 250,000 CRB per solution |
-| Halving Interval | Every 200,000 solutions |
+| Initial Reward | 25,000 CRB per solution |
+| Halving Interval | Every 1,000,000 solutions |
 | Vesting | 30-day linear release |
 | Epoch Duration | 600 seconds (10 minutes) |
 | Target Solutions | 50 per epoch |
@@ -77,10 +77,10 @@ Difficulty adjusts each epoch based on solution count vs target (50):
 
 | Total Mined | Reward per Solution |
 |-------------|-------------------|
-| 0 - 199,999 | 250,000 CRB |
-| 200,000 - 399,999 | 125,000 CRB |
-| 400,000 - 599,999 | 62,500 CRB |
-| ... | Halves every 200,000 solutions |
+| 0 - 999,999 | 25,000 CRB |
+| 1,000,000 - 1,999,999 | 12,500 CRB |
+| 2,000,000 - 2,999,999 | 6,250 CRB |
+| ... | Halves every 1,000,000 solutions |
 
 ## Architecture
 
