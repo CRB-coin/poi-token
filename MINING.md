@@ -11,7 +11,7 @@
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/Gus567897/poi-token.git
+git clone https://github.com/CRB-coin/poi-token.git
 cd poi-token/miner
 npm install
 ```
