@@ -13,6 +13,7 @@ import {
 } from "@solana/spl-token";
 import { createHash } from "crypto";
 import * as fs from "fs";
+import * as readline from "readline";
 
 // ── Config ──
 const RPC_URL = process.env.RPC_URL || "https://solana-rpc.publicnode.com";
@@ -24,10 +25,37 @@ const miner = Keypair.fromSecretKey(
   Uint8Array.from(JSON.parse(fs.readFileSync(KEYPAIR_PATH, "utf8")))
 );
 
-// Recipient wallet for CRB tokens (defaults to miner if not set)
-const RECIPIENT = process.env.RECIPIENT
-  ? new PublicKey(process.env.RECIPIENT)
-  : miner.publicKey;
+// Recipient wallet for CRB tokens
+let RECIPIENT: PublicKey;
+
+async function promptRecipient(): Promise<PublicKey> {
+  if (process.env.RECIPIENT) {
+    return new PublicKey(process.env.RECIPIENT);
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    console.log("\n⚠️  No RECIPIENT wallet set. Mining rewards need a recipient address.");
+    console.log("   You can set it via: export RECIPIENT=<wallet-address>\n");
+    rl.question("Enter recipient wallet address (or press Enter to use miner wallet): ", (answer) => {
+      rl.close();
+      const addr = answer.trim();
+      if (addr) {
+        try {
+          const pk = new PublicKey(addr);
+          console.log(`✅ Recipient set to: ${pk.toBase58()}\n`);
+          resolve(pk);
+        } catch {
+          console.log("❌ Invalid address. Using miner wallet as recipient.\n");
+          resolve(miner.publicKey);
+        }
+      } else {
+        console.log(`ℹ️  Using miner wallet as recipient: ${miner.publicKey.toBase58()}\n`);
+        resolve(miner.publicKey);
+      }
+    });
+  });
+}
 
 // ── PDAs ──
 const [stateAddr] = PublicKey.findProgramAddressSync([Buffer.from("mine_state")], PROGRAM_ID);
@@ -336,6 +364,7 @@ async function withdrawVested() {
 
 // ── Main loop ──
 async function main() {
+  RECIPIENT = await promptRecipient();
   console.log("============================================================");
   console.log("  PoI v3.0 Mainnet Miner (with Vesting)");
   console.log("============================================================");
