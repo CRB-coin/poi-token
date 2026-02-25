@@ -149,6 +149,17 @@ You can run multiple miner instances with different wallets. Each miner can subm
 
 After an epoch ends, `advance_epoch` must be called to move to the next round. This is fully permissionless — the miner program calls it automatically. Even if your miner doesn't advance, other miners will.
 
+### Changing Reward Recipient
+
+You can set a separate wallet to receive CRB token rewards. The miner wallet pays gas fees, while the recipient wallet receives the mined tokens.
+
+```bash
+# Set recipient wallet (defaults to miner wallet if not set)
+export RECIPIENT=<your-recipient-wallet-address>
+```
+
+You can change the recipient at any time by updating the environment variable and restarting the miner. Each new solution will use the updated recipient. Previously claimed rewards remain in the original VestingAccount.
+
 ### Do I Need an AI/LLM API?
 
 No. The reference miner uses template-based text generation that meets all on-chain verification rules without any external API. You may optionally integrate an LLM for more creative text, but it is not required.
